@@ -1,15 +1,16 @@
+//! Server is an HTTP(S) server for answering Kubelet callbacks.
+//!
+//! Logs and exec calls are the main things that a server should handle.
+
 use crate::config::ServerConfig;
 use crate::log::{Options, Sender};
 use crate::provider::{NotImplementedError, Provider};
 use http::status::StatusCode;
 use http::Response;
 use hyper::Body;
-/// Server is an HTTP(S) server for answering Kubelet callbacks.
-///
-/// Logs and exec calls are the main things that a server should handle.
-use log::{debug, error};
 use std::convert::Infallible;
 use std::sync::Arc;
+use tracing::{debug, error};
 use warp::Filter;
 
 const PING: &str = "this is the Krustlet HTTP server";
@@ -17,7 +18,7 @@ const PING: &str = "this is the Krustlet HTTP server";
 /// Start the Krustlet HTTP(S) server
 ///
 /// This is a primitive implementation of an HTTP provider for the internal API.
-pub(crate) async fn start<T: 'static + Provider + Send + Sync>(
+pub(crate) async fn start<T: Provider>(
     provider: Arc<T>,
     config: &ServerConfig,
 ) -> anyhow::Result<()> {
@@ -55,7 +56,7 @@ pub(crate) async fn start<T: 'static + Provider + Send + Sync>(
 /// Get the logs from the running container.
 ///
 /// Implements the kubelet path /containerLogs/{namespace}/{pod}/{container}
-async fn get_container_logs<T: 'static + Provider + Send + Sync>(
+async fn get_container_logs<T: Provider>(
     provider: Arc<T>,
     namespace: String,
     pod: String,
@@ -74,15 +75,15 @@ async fn get_container_logs<T: 'static + Provider + Send + Sync>(
         Err(e) => {
             error!("Error fetching logs: {}", e);
             if e.is::<NotImplementedError>() {
-                return_with_code(
+                Ok(return_with_code(
                     StatusCode::NOT_IMPLEMENTED,
                     "Logs not implemented in provider.".to_owned(),
-                )
+                ))
             } else {
-                return_with_code(
+                Ok(return_with_code(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Server error: {}", e),
-                )
+                ))
             }
         }
     }
@@ -91,20 +92,20 @@ async fn get_container_logs<T: 'static + Provider + Send + Sync>(
 /// Run a pod exec command and get the output
 ///
 /// Implements the kubelet path /exec/{namespace}/{pod}/{container}
-async fn post_exec<T: 'static + Provider + Send + Sync>(
+async fn post_exec<T: Provider>(
     _provider: Arc<T>,
     _namespace: String,
     _pod: String,
     _container: String,
 ) -> Result<Response<Body>, Infallible> {
-    return_with_code(
+    Ok(return_with_code(
         StatusCode::NOT_IMPLEMENTED,
         "Exec not implemented.".to_string(),
-    )
+    ))
 }
 
-fn return_with_code(code: StatusCode, body: String) -> Result<Response<Body>, Infallible> {
+fn return_with_code(code: StatusCode, body: String) -> Response<Body> {
     let mut response = Response::new(body.into());
     *response.status_mut() = code;
-    Ok(response)
+    response
 }

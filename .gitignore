@@ -4,3 +4,8 @@ target/
 _dist/
 node_modules/
 .DS_Store
+
+# oneclick trace files
+krustlet-wasi-e2e.stdout.txt
+krustlet-wasi-e2e.stderr.txt
+oneclick-logs

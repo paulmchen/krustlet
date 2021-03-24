@@ -1,19 +1,17 @@
-#![allow(deprecated)] // TODO: remove when Informer has been replaced by kube_run::watcher
-
 use std::{convert::TryFrom, env, path::Path, str};
 
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::certificates::v1beta1::CertificateSigningRequest;
-use kube::api::{Api, ListParams, PostParams, WatchEvent};
+use kube::api::{Api, ListParams, PostParams};
 use kube::config::Kubeconfig;
-use kube::runtime::Informer;
 use kube::Config;
-use log::{debug, info};
+use kube_runtime::watcher::{watcher, Event};
 use rcgen::{
     Certificate, CertificateParams, DistinguishedName, DnType, KeyPair, SanType,
     PKCS_ECDSA_P256_SHA256,
 };
 use tokio::fs::{read, write};
+use tracing::{debug, info};
 
 use crate::config::Config as KubeletConfig;
 use crate::kubeconfig::exists as kubeconfig_exists;
@@ -21,7 +19,7 @@ use crate::kubeconfig::KUBECONFIG;
 
 const APPROVED_TYPE: &str = "Approved";
 
-/// bootstrap the cluster with TLS certificates
+/// Bootstrap the cluster with TLS certificates but only if no existing kubeconfig can be found.
 pub async fn bootstrap<K: AsRef<Path>>(
     config: &KubeletConfig,
     bootstrap_file: K,
@@ -96,43 +94,48 @@ async fn bootstrap_auth<K: AsRef<Path>>(
         csrs.create(&PostParams::default(), &post_data).await?;
 
         // Wait for CSR signing
-        let inf: Informer<CertificateSigningRequest> = Informer::new(csrs)
-            .params(ListParams::default().fields(&format!("metadata.name={}", config.node_name)));
+        let inf = watcher(
+            csrs,
+            ListParams::default().fields(&format!("metadata.name={}", config.node_name)),
+        );
 
-        let mut watcher = inf.poll().await?.boxed();
+        let mut watcher = inf.boxed();
         let mut generated_kubeconfig = Vec::new();
         let mut got_cert = false;
         let start = std::time::Instant::now();
         while let Some(event) = watcher.try_next().await? {
-            match event {
-                WatchEvent::Modified(m) | WatchEvent::Added(m) => {
-                    // Do we have a cert?
-                    let status = m.status.unwrap();
-                    if let Some(cert) = status.certificate {
-                        if let Some(v) = status.conditions {
-                            if v.into_iter().any(|c| c.type_.as_str() == APPROVED_TYPE) {
-                                generated_kubeconfig = gen_kubeconfig(
-                                    ca_data,
-                                    server,
-                                    cert,
-                                    cert_bundle.serialize_private_key_pem(),
-                                )?;
-                                got_cert = true;
-                                break;
-                            } else {
-                                info!("Got modified event, but CSR for authentication certs is not currently approved, {:?} elapsed", start.elapsed());
-                            }
-                        }
+            let status = match event {
+                Event::Applied(m) => m.status.unwrap(),
+                Event::Restarted(mut certs) => {
+                    // We should only ever get one cert for this node, so error in any circumstance we don't
+                    if certs.len() > 1 {
+                        return Err(anyhow::anyhow!("On watch restart, got more than 1 authentication CSR. This means something is in an incorrect state"));
+                    }
+                    certs.remove(0).status.unwrap()
+                }
+                Event::Deleted(_) => {
+                    return Err(anyhow::anyhow!(
+                        "Authentication CSR was deleted before it was approved"
+                    ))
+                }
+            };
+
+            if let Some(cert) = status.certificate {
+                if let Some(v) = status.conditions {
+                    if v.into_iter().any(|c| c.type_.as_str() == APPROVED_TYPE) {
+                        generated_kubeconfig = gen_kubeconfig(
+                            ca_data,
+                            server,
+                            cert,
+                            cert_bundle.serialize_private_key_pem(),
+                        )?;
+                        got_cert = true;
+                        break;
                     }
                 }
-                WatchEvent::Error(e) => {
-                    return Err(anyhow::anyhow!(
-                        "Error in event stream while waiting for certificate approval {}",
-                        e
-                    ));
-                }
-                WatchEvent::Deleted(_) | WatchEvent::Bookmark(_) => {}
             }
+
+            info!("Got modified event, but CSR for authentication certs is not currently approved, {:?} elapsed", start.elapsed());
         }
 
         if !got_cert {
@@ -192,38 +195,42 @@ async fn bootstrap_tls(
     notify(awaiting_user_csr_approval("TLS", &csr_name));
 
     // Wait for CSR signing
-    let inf: Informer<CertificateSigningRequest> = Informer::new(csrs)
-        .params(ListParams::default().fields(&format!("metadata.name={}", csr_name)));
+    let inf = watcher(
+        csrs,
+        ListParams::default().fields(&format!("metadata.name={}", csr_name)),
+    );
 
-    let mut watcher = inf.poll().await?.boxed();
+    let mut watcher = inf.boxed();
     let mut certificate = String::new();
     let mut got_cert = false;
     let start = std::time::Instant::now();
     while let Some(event) = watcher.try_next().await? {
-        match event {
-            WatchEvent::Modified(m) | WatchEvent::Added(m) => {
-                // Do we have a cert?
-                let status = m.status.unwrap();
-                if let Some(cert) = status.certificate {
-                    if let Some(v) = status.conditions {
-                        if v.into_iter().any(|c| c.type_.as_str() == APPROVED_TYPE) {
-                            certificate = std::str::from_utf8(&cert.0)?.to_owned();
-                            got_cert = true;
-                            break;
-                        } else {
-                            info!("Got modified event, but CSR for serving certs is not currently approved, {:?} remaining", start.elapsed());
-                        }
-                    }
+        let status = match event {
+            Event::Applied(m) => m.status.unwrap(),
+            Event::Restarted(mut certs) => {
+                // We should only ever get one cert for this node, so error in any circumstance we don't
+                if certs.len() > 1 {
+                    return Err(anyhow::anyhow!("On watch restart, got more than 1 serving CSR. This means something is in an incorrect state"));
+                }
+                certs.remove(0).status.unwrap()
+            }
+            Event::Deleted(_) => {
+                return Err(anyhow::anyhow!(
+                    "Serving CSR was deleted before it was approved"
+                ))
+            }
+        };
+
+        if let Some(cert) = status.certificate {
+            if let Some(v) = status.conditions {
+                if v.into_iter().any(|c| c.type_.as_str() == APPROVED_TYPE) {
+                    certificate = std::str::from_utf8(&cert.0)?.to_owned();
+                    got_cert = true;
+                    break;
                 }
             }
-            WatchEvent::Error(e) => {
-                return Err(anyhow::anyhow!(
-                    "Error in event stream while waiting for certificate approval {}",
-                    e
-                ));
-            }
-            WatchEvent::Deleted(_) | WatchEvent::Bookmark(_) => {}
         }
+        info!("Got modified event, but CSR for serving certs is not currently approved, {:?} remaining", start.elapsed());
     }
 
     if !got_cert {
@@ -259,6 +266,9 @@ fn completed_csr_approval(cert_description: &str) -> String {
     )
 }
 
+// Known false positive for non_exhaustive struct `CertificateParams`
+// https://github.com/rust-lang/rust-clippy/issues/6559
+#[allow(clippy::field_reassign_with_default)]
 fn gen_auth_cert(config: &KubeletConfig) -> anyhow::Result<Certificate> {
     let mut params = CertificateParams::default();
     params.not_before = chrono::Utc::now();
@@ -279,6 +289,9 @@ fn gen_auth_cert(config: &KubeletConfig) -> anyhow::Result<Certificate> {
     Ok(Certificate::from_params(params)?)
 }
 
+// Known false positive for non_exhaustive struct `CertificateParams`
+// https://github.com/rust-lang/rust-clippy/issues/6559
+#[allow(clippy::field_reassign_with_default)]
 fn gen_tls_cert(config: &KubeletConfig) -> anyhow::Result<Certificate> {
     let mut params = CertificateParams::default();
     params.not_before = chrono::Utc::now();

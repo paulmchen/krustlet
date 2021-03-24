@@ -6,10 +6,11 @@ use std::convert::TryInto;
 use std::fmt::Display;
 
 mod handle;
+pub mod state;
 mod status;
 
 pub use handle::{Handle, HandleMap};
-pub use status::Status;
+pub use status::{make_initial_container_status, patch_container_status, Status};
 
 /// Specifies how the store should check for module updates
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -159,7 +160,7 @@ impl Container {
     /// Get image of container as `oci_distribution::Reference`.
     pub fn image(&self) -> anyhow::Result<Option<Reference>> {
         match self.0.image.as_ref() {
-            Some(s) => Some(s.clone().try_into()).transpose(),
+            Some(s) => Ok(Some(s.clone().try_into()?)),
             None => Ok(None),
         }
     }

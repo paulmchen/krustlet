@@ -8,11 +8,17 @@ use crate::log::{stream, HandleFactory, Sender};
 
 /// Represents a handle to a running "container" (whatever that might be). This
 /// can be used on its own, however, it is generally better to use it as a part
-/// of a [`pod::Handle`], which manages a group of containers in a Kubernetes
+/// of a [`crate::pod::Handle`], which manages a group of containers in a Kubernetes
 /// Pod
 pub struct Handle<H, F> {
     handle: H,
     handle_factory: F,
+}
+
+impl<H, F> std::fmt::Debug for Handle<H, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContainerHandle").finish()
+    }
 }
 
 impl<H: StopHandler, F> Handle<H, F> {
@@ -47,7 +53,7 @@ impl<H: StopHandler, F> Handle<H, F> {
     /// Wait for the running process to complete. Generally speaking,
     /// [`Handle::stop`] should be called first. This uses the underlying
     /// [`StopHandler`] implementation passed to the constructor
-    pub(crate) async fn wait(&mut self) -> anyhow::Result<()> {
+    pub async fn wait(&mut self) -> anyhow::Result<()> {
         self.handle.wait().await
     }
 }

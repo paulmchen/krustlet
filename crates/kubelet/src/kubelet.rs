@@ -1,21 +1,21 @@
-#![allow(deprecated)] // TODO: remove when Informer has been replaced by kube_run::watcher
-
 ///! This library contains code for running a kubelet. Use this to create a new
 ///! Kubelet with a specific handler (called a `Provider`)
 use crate::config::Config;
 use crate::node;
-use crate::pod::Queue;
+use crate::operator::PodOperator;
+use crate::plugin_watcher::PluginRegistry;
 use crate::provider::Provider;
 use crate::webserver::start as start_webserver;
 
-use futures::future::FutureExt;
-use futures::{StreamExt, TryStreamExt};
-use k8s_openapi::api::core::v1::Pod as KubePod;
-use kube::{api::ListParams, runtime::Informer, Api};
-use log::{debug, error, info, warn};
+use futures::future::{FutureExt, TryFutureExt};
+use kube::api::ListParams;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::signal::ctrl_c;
+use tokio::task;
+use tracing::{error, info, warn};
+
+use krator::OperatorRuntime;
 
 /// A Kubelet server backed by a given `Provider`.
 ///
@@ -35,7 +35,7 @@ pub struct Kubelet<P> {
     config: Box<Config>,
 }
 
-impl<P: 'static + Provider + Sync + Send> Kubelet<P> {
+impl<P: Provider> Kubelet<P> {
     /// Create a new Kubelet with a provider, a kubernetes configuration,
     /// and a kubelet configuration
     pub async fn new(
@@ -64,13 +64,21 @@ impl<P: 'static + Provider + Sync + Send> Kubelet<P> {
 
         // Flag to indicate graceful shutdown has started.
         let signal = Arc::new(AtomicBool::new(false));
-        let signal_task = start_signal_task(Arc::clone(&signal)).fuse();
+        let signal_task = start_signal_task(Arc::clone(&signal)).fuse().boxed();
+
+        let plugin_registrar = start_plugin_registry(self.provider.plugin_registry())
+            .fuse()
+            .boxed();
 
         // Start the webserver
-        let webserver = start_webserver(self.provider.clone(), &self.config.server_config).fuse();
+        let webserver = start_webserver(self.provider.clone(), &self.config.server_config)
+            .fuse()
+            .boxed();
 
         // Start updating the node lease and status periodically
-        let node_updater = start_node_updater(client.clone(), self.config.node_name.clone()).fuse();
+        let node_updater = start_node_updater(client.clone(), self.config.node_name.clone())
+            .fuse()
+            .boxed();
 
         // If any of these tasks fail, we can initiate graceful shutdown.
         let services = Box::pin(async {
@@ -81,6 +89,9 @@ impl<P: 'static + Provider + Sync + Send> Kubelet<P> {
                 res = webserver => error!("Webserver task completed with result {:?}", &res),
                 res = node_updater => if let Err(e) = res {
                     error!("Node updater task completed with error {:?}", &e);
+                },
+                res = plugin_registrar => if let Err(e) = res {
+                    error!("Plugin registrar task completed with error {:?}", &e);
                 }
             };
             // Use relaxed ordering because we just need other tasks to eventually catch the signal.
@@ -94,17 +105,17 @@ impl<P: 'static + Provider + Sync + Send> Kubelet<P> {
             client.clone(),
             self.config.node_name.clone(),
         )
-        .fuse();
+        .fuse()
+        .boxed();
 
-        // Create a queue that locks on events per pod
-        let queue = Queue::new(self.provider.clone(), client.clone());
-        let pod_informer = start_pod_informer::<P>(
-            client.clone(),
-            self.config.node_name.clone(),
-            queue,
-            Arc::clone(&signal),
-        )
-        .fuse();
+        let operator = PodOperator::new(Arc::clone(&self.provider), client.clone());
+        let node_selector = format!("spec.nodeName={}", &self.config.node_name);
+        let params = ListParams {
+            field_selector: Some(node_selector),
+            ..Default::default()
+        };
+        let mut operator_runtime = OperatorRuntime::new(&self.kube_config, operator, Some(params));
+        let operator_task = operator_runtime.start().fuse().boxed();
 
         // These must all be running for graceful shutdown. An error here exits ungracefully.
         let core = Box::pin(async {
@@ -113,10 +124,10 @@ impl<P: 'static + Provider + Sync + Send> Kubelet<P> {
                     error!("Signal handler task joined with error {:?}", &e);
                     e
                 }),
-                res = pod_informer => res.map_err(|e| {
-                    error!("Pod informer task joined with error {:?}", &e);
-                    e
-                })
+                _ = operator_task => {
+                    warn!("Pod operator has completed");
+                    Ok(())
+                }
             }
         });
 
@@ -148,49 +159,19 @@ async fn start_signal_task(signal: Arc<AtomicBool>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Listens for updates to pods on this node and forwards them to queue.
-async fn start_pod_informer<P: 'static + Provider + Sync + Send>(
-    client: kube::Client,
-    node_name: String,
-    mut queue: Queue<P>,
-    signal: Arc<AtomicBool>,
-) -> anyhow::Result<()> {
-    let node_selector = format!("spec.nodeName={}", node_name);
-    let params = ListParams {
-        field_selector: Some(node_selector),
-        ..Default::default()
-    };
-    let api = Api::<KubePod>::all(client);
-    let informer = Informer::new(api).params(params);
-    loop {
-        let mut stream = match informer.poll().await {
-            Ok(stream) => stream.boxed(),
-            Err(e) => {
-                warn!("Error polling pod informer: {:?}", e);
-                tokio::time::delay_for(std::time::Duration::from_secs(5)).await;
-                continue;
-            }
-        };
-        loop {
-            match stream.try_next().await {
-                Ok(Some(event)) => {
-                    debug!("Handling Kubernetes pod event: {:?}", event);
-                    if let kube::api::WatchEvent::Added(_) = event {
-                        if signal.load(Ordering::Relaxed) {
-                            warn!(
-                                "Node is shutting down and unschedulable. Dropping Add Pod event."
-                            );
-                            continue;
-                        }
-                    }
-                    match queue.enqueue(event).await {
-                        Ok(()) => debug!("Enqueued event for processing"),
-                        Err(e) => warn!("Error enqueuing pod event: {}", e),
-                    };
+async fn start_plugin_registry(registrar: Option<Arc<PluginRegistry>>) -> anyhow::Result<()> {
+    match registrar {
+        Some(r) => r.run().await,
+        // Do nothing; just poll forever and "pretend" that a plugin watcher is running
+        None => {
+            task::spawn(async {
+                loop {
+                    // We run a delay here so we don't waste time on NOOP CPU cycles
+                    tokio::time::sleep(tokio::time::Duration::from_secs(std::u64::MAX)).await;
                 }
-                Ok(None) => break,
-                Err(e) => warn!("Error streaming pod events: {:?}", e),
-            }
+            })
+            .map_err(anyhow::Error::from)
+            .await
         }
     }
 }
@@ -200,7 +181,7 @@ async fn start_node_updater(client: kube::Client, node_name: String) -> anyhow::
     let sleep_interval = std::time::Duration::from_secs(10);
     loop {
         node::update(&client, &node_name).await;
-        tokio::time::delay_for(sleep_interval).await;
+        tokio::time::sleep(sleep_interval).await;
     }
 }
 
@@ -217,7 +198,7 @@ async fn start_signal_handler(
             node::drain(&client, &node_name).await?;
             break Ok(());
         }
-        tokio::time::delay_for(duration).await;
+        tokio::time::sleep(duration).await;
     }
 }
 
@@ -225,13 +206,16 @@ async fn start_signal_handler(
 mod test {
     use super::*;
     use crate::container::Container;
-    use crate::pod::Pod;
-    use crate::state::AsyncDrop;
+    use crate::plugin_watcher::PluginRegistry;
+    use crate::pod::{Pod, Status};
     use k8s_openapi::api::core::v1::{
-        Container as KubeContainer, EnvVar, EnvVarSource, ObjectFieldSelector, PodSpec, PodStatus,
+        Container as KubeContainer, EnvVar, EnvVarSource, ObjectFieldSelector, Pod as KubePod,
+        PodSpec, PodStatus,
     };
+    use krator::ObjectState;
     use kube::api::ObjectMeta;
     use std::collections::BTreeMap;
+    use tokio::sync::RwLock;
 
     fn mock_client() -> kube::Client {
         kube::Client::new(kube::Config::new(
@@ -241,23 +225,36 @@ mod test {
 
     struct MockProvider;
 
+    struct ProviderState;
     struct PodState;
 
     #[async_trait::async_trait]
-    impl AsyncDrop for PodState {
-        async fn async_drop(self) {}
+    impl ObjectState for PodState {
+        type Manifest = Pod;
+        type Status = Status;
+        type SharedState = ProviderState;
+        async fn async_drop(self, _provider_state: &mut ProviderState) {}
     }
 
     #[async_trait::async_trait]
     impl Provider for MockProvider {
-        type InitialState = crate::state::Stub;
-        type TerminatedState = crate::state::Stub;
+        type ProviderState = ProviderState;
+        type InitialState = crate::pod::state::Stub;
+        type TerminatedState = crate::pod::state::Stub;
         type PodState = PodState;
 
         const ARCH: &'static str = "mock";
 
         async fn initialize_pod_state(&self, _pod: &Pod) -> anyhow::Result<Self::PodState> {
             Ok(PodState)
+        }
+
+        fn provider_state(&self) -> krator::SharedState<ProviderState> {
+            Arc::new(RwLock::new(ProviderState {}))
+        }
+
+        fn plugin_registry(&self) -> Option<Arc<PluginRegistry>> {
+            Some(Arc::new(PluginRegistry::default()))
         }
 
         async fn logs(
@@ -355,7 +352,7 @@ mod test {
         labels.insert("label".to_string(), "value".to_string());
         let mut annotations = BTreeMap::new();
         annotations.insert("annotation".to_string(), "value".to_string());
-        let pod = Pod::new(KubePod {
+        let pod = Pod::from(KubePod {
             metadata: ObjectMeta {
                 labels: Some(labels),
                 annotations: Some(annotations),

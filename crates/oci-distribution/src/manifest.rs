@@ -3,6 +3,8 @@ use std::collections::HashMap;
 
 /// The mediatype for WASM layers.
 pub const WASM_LAYER_MEDIA_TYPE: &str = "application/vnd.wasm.content.layer.v1+wasm";
+/// The mediatype for a WASM image config.
+pub const WASM_CONFIG_MEDIA_TYPE: &str = "application/vnd.wasm.config.v1+json";
 /// The mediatype for an OCI manifest.
 pub const IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.docker.distribution.manifest.v2+json";
 /// The mediatype for an image config (manifest).
@@ -26,7 +28,7 @@ pub const IMAGE_LAYER_NONDISTRIBUTABLE_GZIP_MEDIA_TYPE: &str =
 ///
 /// It is part of the OCI specification, and is defined here:
 /// https://github.com/opencontainers/image-spec/blob/master/manifest.md
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OciManifest {
     /// This is a schema version.
@@ -73,11 +75,24 @@ impl Default for OciManifest {
     }
 }
 
+/// Versioned provides a struct with the manifest's schemaVersion and mediaType.
+/// Incoming content with unknown schema versions can be decoded against this
+/// struct to check the version.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Versioned {
+    /// schema_version is the image manifest schema that this image follows
+    pub schema_version: i32,
+
+    /// media_type is the media type of this schema.
+    pub media_type: Option<String>,
+}
+
 /// The OCI descriptor is a generic object used to describe other objects.
 ///
 /// It is defined in the OCI Image Specification:
 /// https://github.com/opencontainers/image-spec/blob/master/descriptor.md#properties
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OciDescriptor {
     /// The media type of this descriptor.

@@ -1,12 +1,12 @@
-#![type_length_limit = "1271125"]
 use kubelet::config::Config;
+use kubelet::plugin_watcher::PluginRegistry;
 use kubelet::store::composite::ComposableStore;
 use kubelet::store::oci::FileStore;
 use kubelet::Kubelet;
 use std::sync::Arc;
 use wasi_provider::WasiProvider;
 
-#[tokio::main(threaded_scheduler)]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     // The provider is responsible for all the "back end" logic. If you are creating
     // a new Kubelet, all you need to implement is a provider.
@@ -18,8 +18,9 @@ async fn main() -> anyhow::Result<()> {
     let kubeconfig = kubelet::bootstrap(&config, &config.bootstrap_file, notify_bootstrap).await?;
 
     let store = make_store(&config);
+    let plugin_registry = Arc::new(PluginRegistry::new(&config.plugins_dir));
 
-    let provider = WasiProvider::new(store, &config, kubeconfig.clone()).await?;
+    let provider = WasiProvider::new(store, &config, kubeconfig.clone(), plugin_registry).await?;
     let kubelet = Kubelet::new(provider, kubeconfig, config).await?;
     kubelet.start().await
 }

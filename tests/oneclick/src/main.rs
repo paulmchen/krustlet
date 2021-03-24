@@ -1,4 +1,5 @@
 use std::io::BufRead;
+use std::path::Path;
 
 enum BootstrapReadiness {
     AlreadyBootstrapped,
@@ -10,6 +11,7 @@ const EXIT_CODE_TESTS_PASSED: i32 = 0;
 const EXIT_CODE_TESTS_FAILED: i32 = 1;
 const EXIT_CODE_NEED_MANUAL_CLEANUP: i32 = 2;
 const EXIT_CODE_BUILD_FAILED: i32 = 3;
+const LOG_DIR: &str = "oneclick-logs";
 
 fn main() {
     println!("Ensuring all binaries are built...");
@@ -100,15 +102,10 @@ fn prepare_for_bootstrap() -> BootstrapReadiness {
         .into_string()
         .expect("Can't get host name");
 
-    let cert_paths: Vec<_> = vec![
-        "krustlet-wasi.crt",
-        "krustlet-wasi.key",
-        "krustlet-wascc.crt",
-        "krustlet-wascc.key",
-    ]
-    .iter()
-    .map(|f| config_dir().join(f))
-    .collect();
+    let cert_paths: Vec<_> = vec!["krustlet-wasi.crt", "krustlet-wasi.key"]
+        .iter()
+        .map(|f| config_dir().join(f))
+        .collect();
 
     let status = all_or_none(cert_paths);
 
@@ -126,20 +123,13 @@ fn prepare_for_bootstrap() -> BootstrapReadiness {
 
     // TODO: allow override of host names
     let wasi_host_name = &host_name;
-    let wascc_host_name = &host_name;
 
     let wasi_cert_name = format!("{}-tls", wasi_host_name);
-    let wascc_cert_name = format!("{}-tls", wascc_host_name);
 
-    let csr_spawn_deletes: Vec<_> = vec![
-        "krustlet-wasi",
-        "krustlet-wascc",
-        &wasi_cert_name,
-        &wascc_cert_name,
-    ]
-    .iter()
-    .map(delete_csr)
-    .collect();
+    let csr_spawn_deletes: Vec<_> = vec!["krustlet-wasi", &wasi_cert_name]
+        .iter()
+        .map(delete_csr)
+        .collect();
 
     let (csr_deletions, csr_spawn_delete_errors) = csr_spawn_deletes.partition_success();
 
@@ -277,6 +267,8 @@ fn launch_kubelet(
     let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let bin_path = repo_root.join("target/debug").join(name);
 
+    let stderr = std::fs::File::create(Path::new(LOG_DIR).join(format!("{}.stderr", name)))?;
+
     let mut launch_kubelet_process = std::process::Command::new(bin_path)
         .args(&[
             "--node-name",
@@ -295,10 +287,10 @@ fn launch_kubelet(
         .env("KUBECONFIG", kubeconfig)
         .env(
             "RUST_LOG",
-            "wascc_host=debug,wascc_provider=debug,wasi_provider=debug,main=debug",
+            "wasi_provider=debug,main=debug,krator::state=debug,kubelet::container::state=debug",
         )
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(stderr)
         .spawn()?;
 
     println!("Kubelet process {} launched", name);
@@ -387,6 +379,14 @@ struct OwnedChildProcess {
 
 impl OwnedChildProcess {
     fn terminate(&mut self) -> anyhow::Result<()> {
+        match self.exited() {
+            Ok(true) | Err(_) => {
+                eprintln!("Krutlet already exited.");
+                return Ok(());
+            }
+            Ok(false) => (),
+        }
+
         match self.child.kill().and_then(|_| self.child.wait()) {
             Ok(_) => {
                 self.terminated = true;
@@ -417,61 +417,50 @@ impl Drop for OwnedChildProcess {
 }
 
 fn run_tests(readiness: BootstrapReadiness) -> anyhow::Result<()> {
+    std::fs::create_dir_all(LOG_DIR)?;
     let wasi_process_result = launch_kubelet(
         "krustlet-wasi",
         "wasi",
         3001,
         matches!(readiness, BootstrapReadiness::NeedBootstrapAndApprove),
     );
-    let wascc_process_result = launch_kubelet(
-        "krustlet-wascc",
-        "wascc",
-        3000,
-        matches!(readiness, BootstrapReadiness::NeedBootstrapAndApprove),
-    );
 
-    for process in &[&wasi_process_result, &wascc_process_result] {
-        match process {
-            Err(e) => {
-                eprintln!("Error running kubelet process: {}", e);
-                return Err(anyhow::anyhow!("Error running kubelet process: {}", e));
-            }
-            Ok(_) => println!("Running kubelet process"),
+    let mut wasi_process = match wasi_process_result {
+        Err(e) => {
+            eprintln!("Error running kubelet process: {}", e);
+            return Err(anyhow::anyhow!("Error running kubelet process: {}", e));
         }
-    }
+        Ok(process) => {
+            println!("Running kubelet process");
+            process
+        }
+    };
 
-    let test_result = run_test_suite();
-
-    let mut wasi_process = wasi_process_result.unwrap();
-    let mut wascc_process = wascc_process_result.unwrap();
+    let test_result = run_test_suite(&mut wasi_process);
 
     if matches!(test_result, Err(_)) {
         warn_if_premature_exit(&mut wasi_process, "krustlet-wasi");
-        warn_if_premature_exit(&mut wascc_process, "krustlet-wascc");
         // TODO: ideally we shouldn't have to wait for termination before getting logs
-        let terminate_result = wasi_process
-            .terminate()
-            .and_then(|_| wascc_process.terminate());
-        match terminate_result {
-            Ok(_) => {
-                let wasi_log_destination = std::path::PathBuf::from("./krustlet-wasi-e2e");
-                capture_kubelet_logs(
-                    "krustlet-wasi",
-                    &mut wasi_process.child,
-                    wasi_log_destination,
-                );
-                let wascc_log_destination = std::path::PathBuf::from("./krustlet-wascc-e2e");
-                capture_kubelet_logs(
-                    "krustlet-wascc",
-                    &mut wascc_process.child,
-                    wascc_log_destination,
-                );
-            }
-            Err(e) => {
-                eprintln!("{}", e);
-                eprintln!("Can't capture kubelet logs as they didn't terminate");
+        match wasi_process.exited() {
+            Ok(true) | Err(_) => (),
+            Ok(false) => {
+                let terminate_result = wasi_process.terminate();
+                match terminate_result {
+                    Ok(_) => (),
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        eprintln!("Can't capture kubelet logs as they didn't terminate");
+                        anyhow::bail!("Error terminating Krustlet process.");
+                    }
+                }
             }
         }
+        let wasi_log_destination = std::path::PathBuf::from(LOG_DIR);
+        capture_kubelet_logs(
+            "krustlet-wasi",
+            &mut wasi_process.child,
+            wasi_log_destination,
+        );
     }
 
     test_result
@@ -488,28 +477,39 @@ fn warn_if_premature_exit(process: &mut OwnedChildProcess, name: &str) {
     };
 }
 
-fn run_test_suite() -> anyhow::Result<()> {
+fn run_test_suite(krustlet_process: &mut OwnedChildProcess) -> anyhow::Result<()> {
     println!("Launching integration tests");
-    let test_process = std::process::Command::new("cargo")
+    let stdout = std::fs::File::create(Path::new(LOG_DIR).join("integration_tests.stdout"))?;
+    let stderr = std::fs::File::create(Path::new(LOG_DIR).join("integration_tests.stderr"))?;
+
+    let mut test_process = std::process::Command::new("cargo")
         .args(&["test", "--test", "integration_tests"])
-        .stderr(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
+        .stderr(stdout)
+        .stdout(stderr)
         .spawn()?;
     println!("Integration tests running");
-    // TODO: consider streaming progress
-    // TODO: capture pod logs: probably requires cooperation from the test
-    // process
-    let test_process_result = test_process.wait_with_output()?;
-    if test_process_result.status.success() {
-        println!("Integration tests PASSED");
-        Ok(())
-    } else {
-        let stdout = String::from_utf8(test_process_result.stdout)?;
-        eprintln!("{}", stdout);
-        let stderr = String::from_utf8(test_process_result.stderr)?;
-        eprintln!("{}", stderr);
-        eprintln!("Integration tests FAILED");
-        Err(anyhow::anyhow!(stderr))
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(result) = test_process.try_wait()? {
+            if result.success() {
+                println!("Integration tests PASSED");
+                return Ok(());
+            } else {
+                println!("Integration tests FAILED");
+                anyhow::bail!("Integration tests FAILED");
+            }
+        }
+        let now = std::time::Instant::now();
+        if now.duration_since(start).as_secs() > 600 {
+            anyhow::bail!("Integration tests TIMED OUT");
+        }
+        match krustlet_process.exited() {
+            Ok(true) | Err(_) => {
+                eprintln!("Detected Krustlet exited.");
+                anyhow::bail!("Detected Krustlet exited.")
+            }
+            Ok(false) => (),
+        }
     }
 }
 
@@ -519,12 +519,8 @@ fn capture_kubelet_logs(
     destination: std::path::PathBuf,
 ) {
     let stdout = kubelet_process.stdout.as_mut().unwrap();
-    let stdout_path = destination.with_extension("stdout.txt");
+    let stdout_path = destination.join(format!("{}.stdout", kubelet_name));
     write_kubelet_log_to_file(kubelet_name, stdout, stdout_path);
-
-    let stderr = kubelet_process.stderr.as_mut().unwrap();
-    let stderr_path = destination.with_extension("stderr.txt");
-    write_kubelet_log_to_file(kubelet_name, stderr, stderr_path);
 }
 
 fn write_kubelet_log_to_file(

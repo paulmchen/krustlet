@@ -1,20 +1,17 @@
 use anyhow::bail;
-use log::{debug, error, info};
 use std::collections::HashMap;
-use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tracing::{debug, error, info, warn};
 
 use tempfile::NamedTempFile;
-use tokio::sync::{
-    oneshot,
-    watch::{self, Sender},
-};
+use tokio::sync::mpsc::Sender;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use wasi_common::preopen_dir;
+use wasi_cap_std_sync::WasiCtxBuilder;
 use wasmtime::InterruptHandle;
-use wasmtime_wasi::old::snapshot_0::Wasi as WasiUnstable;
-use wasmtime_wasi::{Wasi, WasiCtxBuilder};
+use wasmtime_wasi::snapshots::preview_0::Wasi as WasiUnstable;
+use wasmtime_wasi::snapshots::preview_1::Wasi;
 
 use kubelet::container::Handle as ContainerHandle;
 use kubelet::container::Status;
@@ -41,10 +38,14 @@ impl StopHandler for Runtime {
 /// WasiRuntime provides a WASI compatible runtime. A runtime should be used for
 /// each "instance" of a process and can be passed to a thread pool for running
 pub struct WasiRuntime {
+    // name of the process
+    name: String,
     /// Data needed for the runtime
     data: Arc<Data>,
     /// The tempfile that output from the wasmtime process writes to
     output: Arc<NamedTempFile>,
+    /// A channel to send status updates on the runtime
+    status_sender: Sender<Status>,
 }
 
 struct Data {
@@ -85,11 +86,13 @@ impl WasiRuntime {
     ///     the same path will be allowed in the runtime
     /// * `log_dir` - location for storing logs
     pub async fn new<L: AsRef<Path> + Send + Sync + 'static>(
+        name: String,
         module_data: Vec<u8>,
         env: HashMap<String, String>,
         args: Vec<String>,
         dirs: HashMap<PathBuf, Option<PathBuf>>,
         log_dir: L,
+        status_sender: Sender<Status>,
     ) -> anyhow::Result<Self> {
         let temp = tokio::task::spawn_blocking(move || -> anyhow::Result<NamedTempFile> {
             Ok(NamedTempFile::new_in(log_dir)?)
@@ -103,6 +106,7 @@ impl WasiRuntime {
         // loop that runs elsewhere. These will get deleted when the reference
         // is dropped
         Ok(WasiRuntime {
+            name,
             data: Arc::new(Data {
                 module_data,
                 env,
@@ -110,6 +114,7 @@ impl WasiRuntime {
                 dirs,
             }),
             output: Arc::new(temp),
+            status_sender,
         })
     }
 
@@ -122,11 +127,7 @@ impl WasiRuntime {
         })
         .await??;
 
-        let (status_sender, status_recv) = watch::channel(Status::Waiting {
-            timestamp: chrono::Utc::now(),
-            message: "No status has been received from the process".into(),
-        });
-        let (interrupt_handle, handle) = self.spawn_wasmtime(status_sender, output_write).await?;
+        let (interrupt_handle, handle) = self.spawn_wasmtime(output_write).await?;
 
         let log_handle_factory = HandleFactory {
             temp: self.output.clone(),
@@ -138,7 +139,6 @@ impl WasiRuntime {
                 interrupt_handle,
             },
             log_handle_factory,
-            status_recv,
         ))
     }
 
@@ -147,40 +147,59 @@ impl WasiRuntime {
     // needs to be done within the spawned task
     async fn spawn_wasmtime(
         &self,
-        status_sender: Sender<Status>,
         output_write: std::fs::File,
     ) -> anyhow::Result<(InterruptHandle, JoinHandle<anyhow::Result<()>>)> {
         // Clone the module data Arc so it can be moved
         let data = self.data.clone();
-
+        let status_sender = self.status_sender.clone();
         let (tx, rx) = oneshot::channel();
 
+        let name = self.name.clone();
         let handle = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let env: Vec<(String, String)> = data
+                .env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let stdout = unsafe { cap_std::fs::File::from_std(output_write.try_clone()?) };
+            let stdout = wasi_cap_std_sync::file::File::from_cap_std(stdout);
+            let stderr = unsafe { cap_std::fs::File::from_std(output_write.try_clone()?) };
+            let stderr = wasi_cap_std_sync::file::File::from_cap_std(stderr);
+
             // Build the WASI instance and then generate a list of WASI modules
-            let mut ctx_builder_snapshot = WasiCtxBuilder::new();
+            let ctx_builder_snapshot = WasiCtxBuilder::new();
             let mut ctx_builder_snapshot = ctx_builder_snapshot
-                .args(&data.args)
-                .envs(&data.env)
-                .stdout(wasi_common::OsFile::try_from(output_write.try_clone()?)?)
-                .stderr(wasi_common::OsFile::try_from(output_write.try_clone()?)?);
-            let mut ctx_builder_unstable = wasi_common::old::snapshot_0::WasiCtxBuilder::new();
+                .args(&data.args)?
+                .envs(&env)?
+                .stdout(Box::new(stdout))
+                .stderr(Box::new(stderr));
+
+            let stdout = unsafe { cap_std::fs::File::from_std(output_write.try_clone()?) };
+            let stdout = wasi_cap_std_sync::file::File::from_cap_std(stdout);
+            let stderr = unsafe { cap_std::fs::File::from_std(output_write.try_clone()?) };
+            let stderr = wasi_cap_std_sync::file::File::from_cap_std(stderr);
+
+            let ctx_builder_unstable = WasiCtxBuilder::new();
             let mut ctx_builder_unstable = ctx_builder_unstable
-                .args(&data.args)
-                .envs(&data.env)
-                .stdout(output_write.try_clone()?)
-                .stderr(output_write);
+                .args(&data.args)?
+                .envs(&env)?
+                .stdout(Box::new(stdout))
+                .stderr(Box::new(stderr));
 
             for (key, value) in data.dirs.iter() {
                 let guest_dir = value.as_ref().unwrap_or(key);
                 debug!(
-                    "mounting hostpath {} as guestpath {}",
+                    "{} mounting hostpath {} as guestpath {}",
+                    &name,
                     key.display(),
                     guest_dir.display()
                 );
+                let preopen_dir = unsafe { cap_std::fs::Dir::open_ambient_dir(key) }?;
                 ctx_builder_snapshot =
-                    ctx_builder_snapshot.preopened_dir(preopen_dir(key)?, guest_dir);
+                    ctx_builder_snapshot.preopened_dir(preopen_dir, guest_dir)?;
+                let preopen_dir = unsafe { cap_std::fs::Dir::open_ambient_dir(key) }?;
                 ctx_builder_unstable =
-                    ctx_builder_unstable.preopened_dir(preopen_dir(key)?, guest_dir);
+                    ctx_builder_unstable.preopened_dir(preopen_dir, guest_dir)?;
             }
             let wasi_ctx_snapshot = ctx_builder_snapshot.build()?;
             let wasi_ctx_unstable = ctx_builder_unstable.build()?;
@@ -192,22 +211,31 @@ impl WasiRuntime {
             tx.send(interrupt)
                 .map_err(|_| anyhow::anyhow!("Unable to send interrupt back to main thread"))?;
 
-            let wasi_snapshot = Wasi::new(&store, wasi_ctx_snapshot);
-            let wasi_unstable = WasiUnstable::new(&store, wasi_ctx_unstable);
+            let wasi_snapshot = Wasi::new(
+                &store,
+                std::rc::Rc::new(std::cell::RefCell::new(wasi_ctx_snapshot)),
+            );
+            let wasi_unstable = WasiUnstable::new(
+                &store,
+                std::rc::Rc::new(std::cell::RefCell::new(wasi_ctx_unstable)),
+            );
             let module = match wasmtime::Module::new(&engine, &data.module_data) {
                 // We can't map errors here or it moves the send channel, so we
                 // do it in a match
                 Ok(m) => m,
                 Err(e) => {
                     let message = "unable to create module";
-                    error!("{}: {:?}", message, e);
-                    status_sender
-                        .broadcast(Status::Terminated {
+                    error!("{} {}: {:?}", &name, message, e);
+                    send(
+                        &status_sender,
+                        &name,
+                        Status::Terminated {
                             failed: true,
                             message: message.into(),
                             timestamp: chrono::Utc::now(),
-                        })
-                        .expect("status should be able to send");
+                        },
+                    );
+
                     return Err(anyhow::anyhow!("{}: {}", message, e));
                 }
             };
@@ -215,19 +243,16 @@ impl WasiRuntime {
             let imports = module
                 .imports()
                 .map(|i| {
+                    let name = i.name().unwrap();
                     // This is super funky logic, but it matches what is in 0.12.0
                     let export = match i.module() {
-                        "wasi_snapshot_preview1" => wasi_snapshot.get_export(i.name()),
-                        "wasi_unstable" => wasi_unstable.get_export(i.name()),
+                        "wasi_snapshot_preview1" => wasi_snapshot.get_export(name),
+                        "wasi_unstable" => wasi_unstable.get_export(name),
                         other => bail!("import module `{}` was not found", other),
                     };
                     match export {
                         Some(export) => Ok(export.clone().into()),
-                        None => bail!(
-                            "import `{}` was not found in module `{}`",
-                            i.name(),
-                            i.module()
-                        ),
+                        None => bail!("import `{}` was not found in module `{}`", name, i.module()),
                     }
                 })
                 .collect::<Result<Vec<_>, _>>();
@@ -237,14 +262,17 @@ impl WasiRuntime {
                 Ok(m) => m,
                 Err(e) => {
                     let message = "unable to load module";
-                    error!("{}: {:?}", message, e);
-                    status_sender
-                        .broadcast(Status::Terminated {
+                    error!("{} {}: {:?}", &name, message, e);
+                    send(
+                        &status_sender,
+                        &name,
+                        Status::Terminated {
                             failed: true,
                             message: message.into(),
                             timestamp: chrono::Utc::now(),
-                        })
-                        .expect("status should be able to send");
+                        },
+                    );
+
                     return Err(e);
                 }
             };
@@ -255,14 +283,17 @@ impl WasiRuntime {
                 Ok(m) => m,
                 Err(e) => {
                     let message = "unable to instantiate module";
-                    error!("{}: {:?}", message, e);
-                    status_sender
-                        .broadcast(Status::Terminated {
+                    error!("{} {}: {:?}", &name, message, e);
+                    send(
+                        &status_sender,
+                        &name,
+                        Status::Terminated {
                             failed: true,
                             message: message.into(),
                             timestamp: chrono::Utc::now(),
-                        })
-                        .expect("status should be able to send");
+                        },
+                    );
+
                     // Converting from anyhow
                     return Err(anyhow::anyhow!("{}: {}", message, e));
                 }
@@ -270,21 +301,34 @@ impl WasiRuntime {
 
             // NOTE(taylor): In the future, if we want to pass args directly, we'll
             // need to do a bit more to pass them in here.
-            info!("starting run of module");
-            status_sender
-                .broadcast(Status::Running {
+            info!("{} starting run of module", &name);
+            send(
+                &status_sender,
+                &name,
+                Status::Running {
                     timestamp: chrono::Utc::now(),
-                })
-                .expect("status should be able to send");
+                },
+            );
+
             let export = instance
                 .get_export("_start")
                 .ok_or_else(|| anyhow::anyhow!("_start import doesn't exist in wasm module"))?;
             let func = match export {
                 wasmtime::Extern::Func(f) => f,
                 _ => {
-                    return Err(anyhow::anyhow!(
-                    "_start import was not a function. This is likely a problem with the module"
-                ))
+                    let message = "_start import was not a function. This is likely a problem with the module";
+                    error!("{} {}", &name, message);
+                    send(
+                        &status_sender,
+                        &name,
+                        Status::Terminated {
+                            failed: true,
+                            message: message.into(),
+                            timestamp: chrono::Utc::now(),
+                        },
+                    );
+
+                    return Err(anyhow::anyhow!(message));
                 }
             };
             match func.call(&[]) {
@@ -293,30 +337,42 @@ impl WasiRuntime {
                 Ok(_) => {}
                 Err(e) => {
                     let message = "unable to run module";
-                    error!("{}: {:?}", message, e);
-                    status_sender
-                        .broadcast(Status::Terminated {
+                    error!("{} {}: {:?}", &name, message, e);
+                    send(
+                        &status_sender,
+                        &name,
+                        Status::Terminated {
                             failed: true,
                             message: message.into(),
                             timestamp: chrono::Utc::now(),
-                        })
-                        .expect("status should be able to send");
+                        },
+                    );
+
                     return Err(anyhow::anyhow!("{}: {}", message, e));
                 }
             };
 
-            info!("module run complete");
-            status_sender
-                .broadcast(Status::Terminated {
+            info!("{} module run complete", &name);
+            send(
+                &status_sender,
+                &name,
+                Status::Terminated {
                     failed: false,
                     message: "Module run completed".into(),
                     timestamp: chrono::Utc::now(),
-                })
-                .expect("status should be able to send");
+                },
+            );
             Ok(())
         });
         // Wait for the interrupt to be sent back to us
         let interrupt = rx.await?;
         Ok((interrupt, handle))
+    }
+}
+
+fn send(sender: &Sender<Status>, name: &str, status: Status) {
+    match sender.blocking_send(status) {
+        Err(e) => warn!("{} error sending wasi status: {:?}", name, e),
+        Ok(_) => debug!("{} send completed.", name),
     }
 }

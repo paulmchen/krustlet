@@ -14,9 +14,9 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::api::{Api, ListParams, ObjectMeta, PatchParams, PostParams};
 use kube::error::ErrorResponse;
 use kube::Error;
-use log::{debug, error, info, warn};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use tracing::{debug, error, info, warn};
 
 const KUBELET_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -33,7 +33,7 @@ macro_rules! retry {
                     if $on_err(e, n) {
                         break result;
                     };
-                    tokio::time::delay_for(duration).await;
+                    tokio::time::sleep(duration).await;
                     duration *= (n + 1) as u32;
                     if n == $num_times {
                         break result;
@@ -65,11 +65,7 @@ macro_rules! retry {
 /// A node comes with a lease, and we maintain the lease to tell Kubernetes that the
 /// node remains alive and functional. Note that this will not work in
 /// versions of Kubernetes prior to 1.14.
-pub async fn create<P: 'static + Provider + Sync + Send>(
-    client: &kube::Client,
-    config: &Config,
-    provider: Arc<P>,
-) {
+pub async fn create<P: Provider>(client: &kube::Client, config: &Config, provider: Arc<P>) {
     let node_client: Api<KubeNode> = Api::all(client.clone());
 
     match retry!(node_client.get(&config.node_name).await, times: 4, break_on: &Error::Api(ErrorResponse { code: 404, .. }))
@@ -201,7 +197,7 @@ pub async fn evict_pods(client: &kube::Client, node_name: &str) -> anyhow::Resul
     info!("Evicting {} pods.", pods.len());
 
     for pod in pods {
-        let pod = Pod::new(pod);
+        let pod = Pod::from(pod);
         if pod.is_daemonset() {
             info!("Skipping eviction of DaemonSet '{}'", pod.name());
             continue;
@@ -215,19 +211,22 @@ pub async fn evict_pods(client: &kube::Client, node_name: &str) -> anyhow::Resul
                     "status": {
                         "phase": Phase::Succeeded,
                         "reason": "Pod terminated on node shutdown.",
-                        "containerStatuses": pod.all_containers().iter().map(|key| {
+                        "containerStatuses": pod.all_containers().iter().map(|container| {
                             ContainerStatus::Terminated {
                                 timestamp: Utc::now(),
                                 message: "Evicted on node shutdown".to_string(),
                                 failed: false
-                            }.to_kubernetes(key.name())
+                            }.to_kubernetes(container.name())
                         }).collect::<Vec<KubeContainerStatus>>()
                     }
                 }
             );
-            let data = serde_json::to_vec(&patch)?;
-            api.patch_status(&pod.name(), &PatchParams::default(), data)
-                .await?;
+            api.patch_status(
+                &pod.name(),
+                &PatchParams::default(),
+                &kube::api::Patch::Strategic(patch),
+            )
+            .await?;
 
             info!("Marked static pod as terminated.");
             continue;
@@ -267,7 +266,7 @@ async fn evict_pod(
         info!("Waiting for pod '{}' eviction.", name);
         while let Some(event) = stream.try_next().await? {
             if let kube::api::WatchEvent::Deleted(s) = event {
-                let pod = Pod::new(s);
+                let pod = Pod::from(s);
                 if name == pod.name() && namespace == pod.namespace() {
                     info!("Pod '{}' evicted.", name);
                     break;
@@ -316,7 +315,7 @@ async fn update_status(node_name: &str, client: &kube::Client) -> anyhow::Result
         .patch_status(
             node_name,
             &PatchParams::default(),
-            serde_json::to_vec(&status_patch)?,
+            &kube::api::Patch::Strategic(status_patch),
         )
         .await
         .map_err(|e| anyhow::anyhow!("Unable to patch node status: {}", e))?;
@@ -378,11 +377,13 @@ async fn update_lease(
     let leases: Api<Lease> = Api::namespaced(client.clone(), "kube-node-lease");
 
     let lease = lease_definition(node_uid, node_name);
-    let lease_data =
-        serde_json::to_vec(&lease).expect("Lease should always be serializable to JSON");
 
     let resp = leases
-        .patch(node_name, &PatchParams::default(), lease_data)
+        .patch(
+            node_name,
+            &PatchParams::default(),
+            &kube::api::Patch::Strategic(lease),
+        )
         .await;
     match &resp {
         Ok(_) => debug!("Lease updated for '{}'", node_name),
@@ -440,8 +441,8 @@ fn lease_spec_definition(node_name: &str) -> serde_json::Value {
 /// Default values and passed node-labels arguments are injected by config.
 fn node_labels_definition(arch: &str, config: &Config, builder: &mut Builder) {
     // Add mandatory static labels
-    builder.add_label("beta.kubernetes.io/os", "linux");
-    builder.add_label("kubernetes.io/os", "linux");
+    builder.add_label("beta.kubernetes.io/os", arch);
+    builder.add_label("kubernetes.io/os", arch);
     builder.add_label("type", "krustlet");
     // add the mandatory labels that are dependent on injected values
     builder.add_label("beta.kubernetes.io/arch", arch);
@@ -648,32 +649,41 @@ impl Builder {
 
     /// Build node definition from builder.
     pub fn build(self) -> Node {
-        let mut metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta =
-            Default::default();
-        metadata.name = Some(self.name);
-        metadata.annotations = Some(self.annotations);
-        metadata.labels = Some(self.labels);
+        let metadata = k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some(self.name),
+            annotations: Some(self.annotations),
+            labels: Some(self.labels),
+            ..Default::default()
+        };
 
-        let mut spec: k8s_openapi::api::core::v1::NodeSpec = Default::default();
-        spec.pod_cidr = Some(self.pod_cidr);
-        spec.taints = Some(self.taints);
+        let spec = k8s_openapi::api::core::v1::NodeSpec {
+            pod_cidr: Some(self.pod_cidr),
+            taints: Some(self.taints),
+            ..Default::default()
+        };
 
-        let mut node_info: k8s_openapi::api::core::v1::NodeSystemInfo = Default::default();
-        node_info.architecture = self.architecture;
-        node_info.kube_proxy_version = self.kube_proxy_version;
-        node_info.kubelet_version = self.kubelet_version;
-        node_info.container_runtime_version = self.container_runtime_version;
-        node_info.operating_system = self.operating_system;
+        let node_info = k8s_openapi::api::core::v1::NodeSystemInfo {
+            architecture: self.architecture,
+            kube_proxy_version: self.kube_proxy_version,
+            kubelet_version: self.kubelet_version,
+            container_runtime_version: self.container_runtime_version,
+            operating_system: self.operating_system,
+            ..Default::default()
+        };
 
-        let mut status: k8s_openapi::api::core::v1::NodeStatus = Default::default();
-        status.node_info = Some(node_info);
-        status.capacity = Some(self.capacity);
-        status.allocatable = Some(self.allocatable);
-        status.daemon_endpoints = Some(k8s_openapi::api::core::v1::NodeDaemonEndpoints {
-            kubelet_endpoint: Some(k8s_openapi::api::core::v1::DaemonEndpoint { port: self.port }),
-        });
-        status.conditions = Some(self.conditions);
-        status.addresses = Some(self.addresses);
+        let status = k8s_openapi::api::core::v1::NodeStatus {
+            node_info: Some(node_info),
+            capacity: Some(self.capacity),
+            allocatable: Some(self.allocatable),
+            daemon_endpoints: Some(k8s_openapi::api::core::v1::NodeDaemonEndpoints {
+                kubelet_endpoint: Some(k8s_openapi::api::core::v1::DaemonEndpoint {
+                    port: self.port,
+                }),
+            }),
+            conditions: Some(self.conditions),
+            addresses: Some(self.addresses),
+            ..Default::default()
+        };
 
         let kube_node = k8s_openapi::api::core::v1::Node {
             metadata,
@@ -752,6 +762,7 @@ mod test {
             allow_local_modules: false,
             insecure_registries: None,
             data_dir: PathBuf::new(),
+            plugins_dir: PathBuf::new(),
             node_labels,
             max_pods: 110,
         };

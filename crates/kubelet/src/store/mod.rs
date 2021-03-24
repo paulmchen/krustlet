@@ -11,8 +11,8 @@ use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 
 use async_trait::async_trait;
-use log::debug;
 use oci_distribution::Reference;
+use tracing::debug;
 
 use crate::container::PullPolicy;
 use crate::pod::Pod;
@@ -77,10 +77,8 @@ pub trait Store: Sync {
             pod.name()
         );
         // Fetch all of the container modules in parallel
-        let init_containers = pod.init_containers();
-        let containers = pod.containers();
-        let all_containers = init_containers.iter().chain(containers.iter());
-        let container_module_futures = all_containers.map(move |container| {
+        let all_containers = pod.all_containers();
+        let container_module_futures = all_containers.iter().map(move |container| {
             let reference = container
                 .image()
                 .expect("Could not parse image.")

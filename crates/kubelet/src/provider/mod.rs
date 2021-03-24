@@ -4,14 +4,17 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{ConfigMap, EnvVarSource, Secret};
 use kube::api::Api;
-use log::{error, info};
+use std::sync::Arc;
 use thiserror::Error;
+use tracing::{error, info};
 
 use crate::container::Container;
 use crate::log::Sender;
 use crate::node::Builder;
+use crate::plugin_watcher::PluginRegistry;
 use crate::pod::Pod;
-use crate::state::{AsyncDrop, State};
+use crate::pod::Status as PodStatus;
+use krator::{ObjectState, State};
 
 /// A back-end for a Kubelet.
 ///
@@ -29,27 +32,44 @@ use crate::state::{AsyncDrop, State};
 /// # Example
 /// ```rust
 /// use async_trait::async_trait;
-/// use kubelet::pod::Pod;
+/// use kubelet::plugin_watcher::PluginRegistry;
+/// use kubelet::pod::{Pod, Status};
 /// use kubelet::provider::Provider;
-/// use kubelet::state::{Stub, AsyncDrop};
+/// use kubelet::pod::state::Stub;
+/// use kubelet::pod::state::prelude::*;
+/// use std::sync::Arc;
+/// use tokio::sync::RwLock;
 ///
 /// struct MyProvider;
 ///
+/// struct ProviderState;
 /// struct PodState;
 ///
 /// #[async_trait]
-/// impl AsyncDrop for PodState {
-///     async fn async_drop(self) { }
+/// impl ObjectState for PodState {
+///     type Manifest = Pod;
+///     type Status = Status;
+///     type SharedState = ProviderState;
+///     async fn async_drop(self, _provider_state: &mut ProviderState) { }
 /// }
 ///
 /// #[async_trait]
 /// impl Provider for MyProvider {
+///     type ProviderState = ProviderState;
 ///     type InitialState = Stub;
 ///     type TerminatedState = Stub;
 ///     const ARCH: &'static str = "my-arch";
 ///
 ///     type PodState = PodState;
-///    
+///
+///     fn provider_state(&self) -> SharedState<ProviderState> {
+///         Arc::new(RwLock::new(ProviderState {}))
+///     }
+///
+///     fn plugin_registry(&self) -> Option<Arc<PluginRegistry>> {
+///         Some(Arc::new(Default::default()))
+///     }
+///
 ///     async fn initialize_pod_state(&self, _pod: &Pod) -> anyhow::Result<Self::PodState> {
 ///         Ok(PodState)
 ///     }
@@ -58,9 +78,16 @@ use crate::state::{AsyncDrop, State};
 /// }
 /// ```
 #[async_trait]
-pub trait Provider: Sized {
+pub trait Provider: Sized + Send + Sync + 'static {
+    /// The state of the provider itself.
+    type ProviderState: 'static + Send + Sync;
+
     /// The state that is passed between Pod state handlers.
-    type PodState: 'static + Send + Sync + AsyncDrop;
+    type PodState: ObjectState<
+        Manifest = Pod,
+        Status = PodStatus,
+        SharedState = Self::ProviderState,
+    >;
 
     /// The initial state for Pod state machine.
     type InitialState: Default + State<Self::PodState>;
@@ -70,6 +97,9 @@ pub trait Provider: Sized {
 
     /// Arch returns a string specifying what architecture this provider supports
     const ARCH: &'static str;
+
+    /// Gets the provider state.
+    fn provider_state(&self) -> krator::SharedState<Self::ProviderState>;
 
     /// Allows provider to populate node information.
     async fn node(&self, _builder: &mut Builder) -> anyhow::Result<()> {
@@ -95,6 +125,16 @@ pub trait Provider: Sized {
     /// not available. Override this only when there is an implementation.
     async fn exec(&self, _pod: Pod, _command: String) -> anyhow::Result<Vec<String>> {
         Err(NotImplementedError.into())
+    }
+
+    /// Gets the path at which to construct temporary directories for volumes.
+    fn volume_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// Fetch the CSI driver plugin registry.
+    fn plugin_registry(&self) -> Option<Arc<PluginRegistry>> {
+        None
     }
 
     /// Resolve the environment variables for a container.
@@ -133,6 +173,38 @@ pub trait Provider: Sized {
         }
         env
     }
+}
+
+/// Resolve the environment variables for a container.
+///
+/// This generally should not be overwritten unless you need to handle
+/// environment variable resolution in a special way, such as allowing
+/// custom Downward API fields.
+///
+/// It is safe to call from within your own providers.
+pub async fn env_vars(
+    container: &Container,
+    pod: &Pod,
+    client: &kube::Client,
+) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    let vars = match container.env().as_ref() {
+        Some(e) => e,
+        None => return env,
+    };
+
+    for env_var in vars.clone().into_iter() {
+        let key = env_var.name;
+        let value = match env_var.value {
+            Some(v) => v,
+            None => {
+                on_missing_env_value(env_var.value_from, client, pod.namespace(), &field_map(pod))
+                    .await
+            }
+        };
+        env.insert(key, value);
+    }
+    env
 }
 
 /// Called when an env var does not have a value associated with.

@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 
-use log::{debug, error, info};
 use tokio::io::{AsyncRead, AsyncSeek};
 use tokio::sync::RwLock;
+use tracing::{debug, error, info};
 
-use crate::container::{ContainerMapByName, HandleMap as ContainerHandleMap};
+use crate::container::{
+    ContainerKey, ContainerMapByName, Handle as ContainerHandle, HandleMap as ContainerHandleMap,
+};
 use crate::handle::StopHandler;
 use crate::log::{HandleFactory, Sender};
 use crate::pod::Pod;
@@ -19,7 +21,16 @@ pub struct Handle<H, F> {
     pod: Pod,
     // Storage for the volume references so they don't get dropped until the runtime handle is
     // dropped
+    // TODO: remove this; this is now part of the ModuleRunContext
     _volumes: HashMap<String, Ref>,
+}
+
+impl<H, F> std::fmt::Debug for Handle<H, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Handle")
+            .field("pod", &self.pod.name())
+            .finish()
+    }
 }
 
 impl<H: StopHandler, F> Handle<H, F> {
@@ -28,21 +39,27 @@ impl<H: StopHandler, F> Handle<H, F> {
     /// kubernetes object and to be able to update the status of that object. The optional volumes
     /// parameter allows a caller to pass a map of volumes to keep reference to (so that they will
     /// be dropped along with the pod)
-    pub async fn new(
+    pub fn new(
         container_handles: ContainerHandleMap<H, F>,
         pod: Pod,
         volumes: Option<HashMap<String, Ref>>,
-    ) -> anyhow::Result<Self> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             container_handles: RwLock::new(container_handles),
             pod,
             _volumes: volumes.unwrap_or_default(),
-        })
+        }
+    }
+
+    /// Insert container `Handle` by `ContainerKey`.
+    pub async fn insert_container_handle(&self, key: ContainerKey, value: ContainerHandle<H, F>) {
+        let mut map = self.container_handles.write().await;
+        map.insert(key, value);
     }
 
     /// Streams output from the specified container into the given sender.
     /// Optionally tails the output and/or continues to watch the file and stream changes.
-    pub async fn output<R>(&mut self, container_name: &str, sender: Sender) -> anyhow::Result<()>
+    pub async fn output<R>(&self, container_name: &str, sender: Sender) -> anyhow::Result<()>
     where
         R: AsyncRead + AsyncSeek + Unpin + Send + 'static,
         F: HandleFactory<R>,
@@ -58,9 +75,8 @@ impl<H: StopHandler, F> Handle<H, F> {
     }
 
     /// Signal the pod and all its running containers to stop and wait for them
-    /// to complete. As of right now, there is not a way to do this in wasmtime,
-    /// so this does nothing
-    pub async fn stop(&mut self) -> anyhow::Result<()> {
+    /// to complete.
+    pub async fn stop(&self) -> anyhow::Result<()> {
         {
             let mut handles = self.container_handles.write().await;
             for (key, handle) in handles.iter_mut() {
@@ -89,12 +105,21 @@ impl<H: StopHandler, F> Handle<H, F> {
 
 /// Generates a unique human readable key for storing a handle to a pod in a
 /// hash. This is a convenience wrapper around [pod_key].
+#[deprecated(
+    since = "0.6.0",
+    note = "Please use the new kubelet::pod::PodKey type. This function will be removed in 0.7"
+)]
 pub fn key_from_pod(pod: &Pod) -> String {
+    #[allow(deprecated)]
     pod_key(pod.namespace(), pod.name())
 }
 
 /// Generates a unique human readable key for storing a handle to a pod if you
 /// already have the namespace and pod name.
+#[deprecated(
+    since = "0.6.0",
+    note = "Please use the new kubelet::pod::PodKey type. This function will be removed in 0.7"
+)]
 pub fn pod_key<N: AsRef<str>, T: AsRef<str>>(namespace: N, pod_name: T) -> String {
     format!("{}:{}", namespace.as_ref(), pod_name.as_ref())
 }

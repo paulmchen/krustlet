@@ -1,6 +1,6 @@
 [package]
 name = "wasi-provider"
-version = "0.4.0"
+version = "0.7.0"
 authors = [
     "Matt Butcher <matt.butcher@microsoft.com>",
     "Matthew Fisher <matt.fisher@microsoft.com>",
@@ -9,31 +9,37 @@ authors = [
     "Brian Ketelsen <Brian.Ketelsen@microsoft.com>",
     "Brian Hardock <Brian.Hardock@microsoft.com>",
     "Ryan Levick <rylevick@microsoft.com>",
+    "Kevin Flansburg <kevin.flansburg@gmail.com>",
 ]
 edition = "2018"
 publish = false
 
 [features]
 default = ["native-tls"]
-native-tls = ["kube/native-tls", "kubelet/kube-native-tls"]
-rustls-tls = ["kube/rustls-tls", "kubelet/rustls-tls"]
+native-tls = ["kube/native-tls", "kubelet/kube-native-tls", "krator/kube-native-tls"]
+rustls-tls = ["kube/rustls-tls", "kubelet/rustls-tls", "krator/rustls-tls"]
 
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
 backtrace = "0.3"
-kube = { version= "0.40", default-features = false }
-log = "0.4"
-wasmtime = "0.19"
-wasmtime-wasi = "0.19"
-wasi-common = "0.19"
+kube = { version = "0.48", default-features = false }
+wasmtime = "0.24"
+wasmtime-wasi = "0.24"
+wasi-common = "0.24"
+wasi-cap-std-sync = "0.24"
+cap-std = "0.13"
 tempfile = "3.1"
-kubelet = { path = "../kubelet", version = "0.4", default-features = false }
+serde = "1.0"
+serde_derive = "1.0"
+serde_json = "1.0"
+kubelet = { path = "../kubelet", version = "0.7", default-features = false, features = ["derive"] }
+krator = { path = "../krator", version = "0.2", default-features = false, features = ["derive"] }
 wat = "1.0"
-tokio = { version = "0.2", features = ["fs", "stream", "macros", "io-util", "sync"] }
+tokio = { version = "1.0", features = ["fs", "macros", "io-util", "sync"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
-k8s-openapi = { version = "0.9", default-features = false, features = ["v1_17"] }
+tracing = { version = "0.1", features = ['log'] }
 
 [dev-dependencies]
-oci-distribution = { path = "../oci-distribution", version = "0.3" }
+oci-distribution = { path = "../oci-distribution", version = "0.6" }

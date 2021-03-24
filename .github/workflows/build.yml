@@ -1,30 +1,61 @@
 name: Build and Test
 on:
-  pull_request:
-    paths-ignore:
-      - "docs/**"
+  push:
+    branches:
+      - master
+  pull_request: {}
 jobs:
+  ui_test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: engineerd/configurator@v0.0.5
+        with:
+          name: "just"
+          url: "https://github.com/casey/just/releases/download/v0.5.11/just-v0.5.11-x86_64-unknown-linux-musl.tar.gz" 
+          pathInArchive: "just"
+      - name: UI Test
+        run: |
+          just ui-test ""
   build:
     runs-on: ${{ matrix.config.os }}
+    env: ${{ matrix.config.env }}
     strategy:
       fail-fast: false
       matrix:
         config:
           - {
               os: "ubuntu-latest",
+              arch: "amd64",
+              args: "",
               url: "https://github.com/casey/just/releases/download/v0.5.11/just-v0.5.11-x86_64-unknown-linux-musl.tar.gz",
               name: "just",
               pathInArchive: "just",
+              env: {},
+            }
+          - {
+              os: "ubuntu-latest",
+              arch: "aarch64",
+              args: "--target aarch64-unknown-linux-gnu",
+              url: "https://github.com/casey/just/releases/download/v0.5.11/just-v0.5.11-x86_64-unknown-linux-musl.tar.gz",
+              name: "just",
+              pathInArchive: "just",
+              env: {
+                OPENSSL_DIR: "/usr/local/openssl-aarch64",
+              },
             }
           - {
               os: "macos-latest",
+              arch: "amd64",
+              args: "",
               url: "https://github.com/casey/just/releases/download/v0.5.11/just-v0.5.11-x86_64-apple-darwin.tar.gz",
               name: "just",
               pathInArchive: "just",
+              env: {},
             }
     steps:
       - uses: actions/checkout@v2
-      - uses: engineerd/configurator@v0.0.2
+      - uses: engineerd/configurator@v0.0.5
         with:
           name: ${{ matrix.config.name }}
           url: ${{ matrix.config.url }}
@@ -35,9 +66,23 @@ jobs:
         run: |
           rustup component add rustfmt --toolchain stable-x86_64-apple-darwin
           rustup component add clippy --toolchain stable-x86_64-apple-darwin
+          rustup update stable
+      - name: setup for cross-compile builds
+        if: matrix.config.arch == 'aarch64'
+        run: |
+          sudo apt install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          cd /tmp
+          git clone https://github.com/openssl/openssl
+          cd openssl
+          git checkout OpenSSL_1_1_1h
+          sudo mkdir -p $OPENSSL_DIR
+          ./Configure linux-aarch64 --prefix=$OPENSSL_DIR --openssldir=$OPENSSL_DIR shared
+          make CC=aarch64-linux-gnu-gcc
+          sudo make install
+          rustup target add aarch64-unknown-linux-gnu
       - name: Build
         run: |
-          just build
+          just build ${{ matrix.config.args }}
           just test
   windows-build:
     runs-on: windows-latest
@@ -48,7 +93,7 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v2
-      - uses: engineerd/configurator@v0.0.2
+      - uses: engineerd/configurator@v0.0.5
         with:
           name: just
           url: "https://github.com/casey/just/releases/download/v0.5.11/just-v0.5.11-x86_64-pc-windows-msvc.zip"
@@ -65,27 +110,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
-      - uses: engineerd/setup-kind@v0.4.0
-      - uses: engineerd/configurator@v0.0.1
+      - uses: engineerd/setup-kind@v0.5.0
+        with:
+          version: "v0.9.0"
+      - uses: engineerd/configurator@v0.0.5
         with:
           name: just
           url: https://github.com/casey/just/releases/download/v0.5.11/just-v0.5.11-x86_64-unknown-linux-musl.tar.gz
           pathInArchive: just
-      - name: Run e2e tests
+      - name: Run e2e tests (full)
+        if: ${{ github.event_name == 'push' }}
         env:
-          KRUSTLET_NODE_IP: "172.17.0.1"
-          # The default location for the cert is not accessible on build hosts, so do it in the current dir
-          CONFIG_DIR: "./config"
           KRUSTLET_TEST_ENV: "ci"
           KRUSTLET_E2E_IMAGE_PULL_SECRET: ${{ secrets.KRUSTLET_E2E_IMAGE_PULL_SECRET }}
-        run: |
-          just bootstrap
-          just build
-          KUBECONFIG=${CONFIG_DIR}/kubeconfig-wascc ./target/debug/krustlet-wascc --node-name krustlet-wascc --port 3000 --bootstrap-file ${CONFIG_DIR}/bootstrap.conf --cert-file ./config/krustlet-wascc.crt --private-key-file ./config/krustlet-wascc.key &
-          # Wait for things to start before approving certs and then delete so we don't overlap with the same hostname
-          sleep 5 && kubectl certificate approve $(hostname)-tls
-          sleep 2 && kubectl delete csr $(hostname)-tls 
-          KUBECONFIG=${CONFIG_DIR}/kubeconfig-wasi ./target/debug/krustlet-wasi --node-name krustlet-wasi --port 3001 --bootstrap-file ${CONFIG_DIR}/bootstrap.conf --cert-file ./config/krustlet-wasi.crt --private-key-file ./config/krustlet-wasi.key &
-          sleep 5 && kubectl certificate approve $(hostname)-tls
-          sleep 2 && kubectl delete csr $(hostname)-tls 
-          just test-e2e
+        run: just test-e2e-standalone
+      - name: Run e2e tests (PR)
+        if: ${{ github.event_name == 'pull_request' }}
+        run: just test-e2e-standalone
+      - name: Output krustlet logs (on error)
+        if: ${{ failure() }}
+        run: cat *.txt
+      - uses: actions/upload-artifact@v2
+        if: ${{ always() }}
+        with:
+          name: e2e-logs
+          path: oneclick-logs/

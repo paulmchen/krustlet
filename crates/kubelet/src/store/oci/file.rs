@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use log::debug;
 use oci_distribution::Reference;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
+use tracing::debug;
 
 use super::client::Client;
 use crate::store::LocalStore;
@@ -84,8 +84,12 @@ impl Storer for FileStorer {
         if digest_path.exists() {
             tokio::fs::remove_file(&digest_path).await?;
         }
+        // FIXME: we need to determine the proper file path for each layer rather than assuming it's a single-layer image.
         let module_path = self.pull_file_path(image_ref);
-        tokio::fs::write(&module_path, image_data.content).await?;
+        if image_data.layers.is_empty() {
+            return Err(anyhow::anyhow!("No module layer present in image data"));
+        }
+        tokio::fs::write(&module_path, &image_data.layers[0].data).await?;
         if let Some(d) = image_data.digest {
             tokio::fs::write(&digest_path, d).await?;
         }
@@ -127,7 +131,7 @@ mod test {
     use super::*;
     use crate::container::PullPolicy;
     use crate::store::Store;
-    use oci_distribution::client::ImageData;
+    use oci_distribution::client::{ImageData, ImageLayer};
     use oci_distribution::secrets::RegistryAuth;
     use std::collections::HashMap;
     use std::convert::TryFrom;
@@ -172,7 +176,7 @@ mod test {
                 images.insert(
                     name.to_owned(),
                     ImageData {
-                        content,
+                        layers: vec![ImageLayer::oci_v1(content)],
                         digest: Some(digest.to_owned()),
                     },
                 );
@@ -180,7 +184,7 @@ mod test {
             client
         }
 
-        fn update(&mut self, key: &str, content: Vec<u8>, digest: &str) -> () {
+        fn update(&mut self, key: &str, content: Vec<u8>, digest: &str) {
             let mut images = self
                 .images
                 .write()
@@ -188,7 +192,7 @@ mod test {
             images.insert(
                 key.to_owned(),
                 ImageData {
-                    content,
+                    layers: vec![ImageLayer::oci_v1(content)],
                     digest: Some(digest.to_owned()),
                 },
             );
@@ -205,7 +209,7 @@ mod test {
                 .images
                 .read()
                 .expect("should be able to read from images");
-            match images.get(image_ref.whole()) {
+            match images.get(&image_ref.whole()) {
                 Some(v) => Ok(v.clone()),
                 None => Err(anyhow::anyhow!("error pulling module")),
             }
@@ -217,7 +221,7 @@ mod test {
     }
 
     impl Drop for TemporaryDirectory {
-        fn drop(&mut self) -> () {
+        fn drop(&mut self) {
             std::fs::remove_dir_all(&self.path).expect("Failed to remove temp directory");
         }
     }

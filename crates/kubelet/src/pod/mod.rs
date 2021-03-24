@@ -1,34 +1,39 @@
 //! `pod` is a collection of utilities surrounding the Kubernetes pod API.
 mod handle;
-mod queue;
+pub mod state;
 mod status;
+// Ignore deprecated here as this is just a reexport
+#[allow(deprecated)]
 pub use handle::{key_from_pod, pod_key, Handle};
-pub(crate) use queue::Queue;
-pub use status::{update_status, Phase, Status, StatusMessage};
+pub(crate) use status::initialize_pod_container_statuses;
+pub use status::{
+    make_registered_status, make_status, make_status_with_containers, patch_status, Phase, Status,
+};
 
 use crate::container::{Container, ContainerKey};
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::core::v1::{
     Container as KubeContainer, Pod as KubePod, Volume as KubeVolume,
 };
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::Meta;
+use serde::Deserialize;
+use serde::Serialize;
 
 /// A Kubernetes Pod
 ///
 /// This is a new type around the k8s_openapi Pod definition
 /// providing convenient accessor methods
-#[derive(Default, Debug, Clone)]
-pub struct Pod(KubePod);
+#[derive(Default, Debug, Clone, Deserialize, Serialize)]
+pub struct Pod {
+    #[serde(flatten)]
+    kube_pod: KubePod,
+}
 
 impl Pod {
-    /// Construct a new Pod
-    pub fn new(inner: KubePod) -> Self {
-        Self(inner)
-    }
-
     /// Get the name of the pod
     pub fn name(&self) -> &str {
-        self.0
+        self.kube_pod
             .metadata
             .name
             .as_deref()
@@ -39,55 +44,59 @@ impl Pod {
     ///
     /// Returns "default" if no namespace was explictily set
     pub fn namespace(&self) -> &str {
-        self.0.metadata.namespace.as_deref().unwrap_or("default")
+        self.kube_pod
+            .metadata
+            .namespace
+            .as_deref()
+            .unwrap_or("default")
     }
 
     /// Get the pod's node_selector map
     pub fn node_selector(&self) -> Option<&std::collections::BTreeMap<String, String>> {
-        self.0.spec.as_ref()?.node_selector.as_ref()
+        self.kube_pod.spec.as_ref()?.node_selector.as_ref()
     }
 
     /// Get the pod's service account name
     pub fn service_account_name(&self) -> Option<&str> {
-        let spec = self.0.spec.as_ref()?;
+        let spec = self.kube_pod.spec.as_ref()?;
         spec.service_account_name.as_deref()
     }
 
     /// Get the pod volumes
     pub fn volumes(&self) -> Option<&Vec<KubeVolume>> {
-        let spec = self.0.spec.as_ref()?;
+        let spec = self.kube_pod.spec.as_ref()?;
         spec.volumes.as_ref()
     }
 
     /// Get the pod's host ip
     pub fn host_ip(&self) -> Option<&str> {
-        let status = self.0.status.as_ref()?;
+        let status = self.kube_pod.status.as_ref()?;
         status.host_ip.as_deref()
     }
 
     /// Get the pod's ip
     pub fn pod_ip(&self) -> Option<&str> {
-        let status = self.0.status.as_ref()?;
+        let status = self.kube_pod.status.as_ref()?;
         status.pod_ip.as_deref()
     }
 
     /// Get an iterator over the pod's labels
     pub fn labels(&self) -> &std::collections::BTreeMap<String, String> {
-        self.0.meta().labels.as_ref().unwrap_or_else(|| &EMPTY_MAP)
+        self.kube_pod.meta().labels.as_ref().unwrap_or(&EMPTY_MAP)
     }
 
     ///  Get the pod's annotations
     pub fn annotations(&self) -> &std::collections::BTreeMap<String, String> {
-        self.0
+        self.kube_pod
             .meta()
             .annotations
             .as_ref()
-            .unwrap_or_else(|| &EMPTY_MAP)
+            .unwrap_or(&EMPTY_MAP)
     }
 
     /// Get the names of the pod's image pull secrets
     pub fn image_pull_secrets(&self) -> Vec<String> {
-        match self.0.spec.as_ref() {
+        match self.kube_pod.spec.as_ref() {
             None => vec![],
             Some(spec) => match spec.image_pull_secrets.as_ref() {
                 None => vec![],
@@ -103,12 +112,12 @@ impl Pod {
     /// TODO: A missing owner_references field was an indication of static pod in my testing but I
     /// dont know how reliable this is.
     pub fn is_static(&self) -> bool {
-        self.0.meta().owner_references.is_none()
+        self.kube_pod.meta().owner_references.is_none()
     }
 
     /// Indicate if this pod is part of a Daemonset
     pub fn is_daemonset(&self) -> bool {
-        if let Some(owners) = &self.0.meta().owner_references {
+        if let Some(owners) = &self.kube_pod.meta().owner_references {
             for owner in owners {
                 if owner.kind == "DaemonSet" {
                     return true;
@@ -125,12 +134,49 @@ impl Pod {
 
     /// Get the deletionTimestamp if it exists
     pub fn deletion_timestamp(&self) -> Option<&DateTime<Utc>> {
-        self.0.meta().deletion_timestamp.as_ref().map(|t| &t.0)
+        self.kube_pod
+            .meta()
+            .deletion_timestamp
+            .as_ref()
+            .map(|t| &t.0)
+    }
+
+    /// Find container by `ContainerKey` and return it.
+    pub fn find_container(&self, key: &ContainerKey) -> Option<Container> {
+        let containers: Vec<Container> = if key.is_init() {
+            self.init_containers()
+        } else {
+            self.containers()
+        };
+        containers
+            .into_iter()
+            .find(|container| container.name() == key.name())
+    }
+
+    /// Finds the index of the container in the Pod's container statuses.
+    pub fn container_status_index(&self, key: &ContainerKey) -> Option<usize> {
+        match self.kube_pod.status.as_ref() {
+            Some(status) => {
+                match if key.is_init() {
+                    status.init_container_statuses.as_ref()
+                } else {
+                    status.container_statuses.as_ref()
+                } {
+                    Some(statuses) => statuses
+                        .iter()
+                        .enumerate()
+                        .find(|(_, status)| status.name == key.name())
+                        .map(|(idx, _)| idx),
+                    None => None,
+                }
+            }
+            None => None,
+        }
     }
 
     /// Get a pod's containers
     pub fn containers(&self) -> Vec<Container> {
-        self.0
+        self.kube_pod
             .spec
             .as_ref()
             .map(|s| &s.containers)
@@ -142,7 +188,7 @@ impl Pod {
 
     /// Get a pod's init containers
     pub fn init_containers(&self) -> Vec<Container> {
-        self.0
+        self.kube_pod
             .spec
             .as_ref()
             .and_then(|s| s.init_containers.as_ref())
@@ -153,43 +199,121 @@ impl Pod {
     }
 
     /// Gets all of a pod's containers (init and application)
-    pub fn all_containers(&self) -> Vec<ContainerKey> {
-        let app_containers = self.containers();
-        let app_container_keys = app_containers
-            .iter()
-            .map(|c| ContainerKey::App(c.name().to_owned()));
-        let init_containers = self.containers();
-        let init_container_keys = init_containers
-            .iter()
-            .map(|c| ContainerKey::Init(c.name().to_owned()));
-        app_container_keys.chain(init_container_keys).collect()
+    pub fn all_containers(&self) -> Vec<Container> {
+        let mut app_containers = self.containers();
+        let init_containers = self.init_containers();
+        app_containers.extend(init_containers);
+        app_containers
     }
 
     /// Turn the Pod into the Kubernetes API version of a Pod
     pub fn into_kube_pod(self) -> KubePod {
-        self.0
+        self.kube_pod
     }
 
     /// Turn a reference to a Pod into a reference to the Kubernetes API version of a Pod
     pub fn as_kube_pod(&self) -> &KubePod {
-        &self.0
+        &self.kube_pod
     }
+}
+
+impl k8s_openapi::Metadata for Pod {
+    type Ty = ObjectMeta;
+
+    fn metadata(&self) -> &ObjectMeta {
+        self.kube_pod.metadata()
+    }
+
+    fn metadata_mut(&mut self) -> &mut ObjectMeta {
+        self.kube_pod.metadata_mut()
+    }
+}
+
+impl k8s_openapi::Resource for Pod {
+    const API_VERSION: &'static str = "v1";
+    const GROUP: &'static str = "";
+    const KIND: &'static str = "Pod";
+    const VERSION: &'static str = "v1";
 }
 
 impl std::convert::From<KubePod> for Pod {
     fn from(api_pod: KubePod) -> Self {
-        Self(api_pod)
+        Self { kube_pod: api_pod }
     }
 }
 
 impl<'a> std::convert::From<&'a Pod> for &'a KubePod {
     fn from(pod: &'a Pod) -> Self {
-        &pod.0
+        &pod.kube_pod
     }
 }
 impl std::convert::From<Pod> for KubePod {
     fn from(pod: Pod) -> Self {
-        pod.0
+        pod.kube_pod
+    }
+}
+
+/// PodKey is a unique human readable key for storing a handle to a pod in a hash.
+#[derive(Hash, Ord, Eq, PartialOrd, PartialEq, Debug, Clone, Default)]
+pub struct PodKey {
+    name: String,
+    namespace: String,
+}
+
+impl PodKey {
+    /// Creates a new pod key from arbitrary strings. In general, you'll likely want to use
+    /// [`PodKey::from`] to convert from a Kubernetes Pod or our internal [`Pod`] representation
+    pub fn new<N: AsRef<str>, T: AsRef<str>>(namespace: N, pod_name: T) -> Self {
+        PodKey {
+            name: pod_name.as_ref().to_owned(),
+            namespace: namespace.as_ref().to_owned(),
+        }
+    }
+
+    /// Returns the name of the pod in the pod key
+    pub fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    /// Returns the namespace of the pod in the pod key
+    pub fn namespace(&self) -> String {
+        self.namespace.clone()
+    }
+}
+
+impl From<Pod> for PodKey {
+    fn from(p: Pod) -> Self {
+        PodKey {
+            name: p.name().to_owned(),
+            namespace: p.namespace().to_owned(),
+        }
+    }
+}
+
+impl From<&Pod> for PodKey {
+    fn from(p: &Pod) -> Self {
+        PodKey {
+            name: p.name().to_owned(),
+            namespace: p.namespace().to_owned(),
+        }
+    }
+}
+
+impl From<KubePod> for PodKey {
+    fn from(p: KubePod) -> Self {
+        PodKey {
+            name: p.name(),
+            namespace: p.namespace().unwrap_or_else(|| "default".to_string()),
+        }
+    }
+}
+
+impl From<&KubePod> for PodKey {
+    fn from(p: &KubePod) -> Self {
+        PodKey {
+            name: p.name(),
+            namespace: p.namespace().unwrap_or_else(|| "default".to_string()),
+        }
     }
 }
 

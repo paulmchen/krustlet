@@ -3,9 +3,9 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::Metadata;
 use kube::api::{Api, DeleteParams, ListParams};
 
-const E2E_NS_PREFIXES: &[&str] = &["wascc-e2e", "wasi-e2e"];
+const E2E_NS_PREFIXES: &[&str] = &["wasi-e2e"];
 
-#[tokio::main(threaded_scheduler)]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     let result = smite_all_integration_test_pods().await;
 
@@ -76,7 +76,7 @@ async fn list_e2e_namespaces(client: kube::Client) -> anyhow::Result<Vec<String>
 }
 
 fn name_of(ns: &impl Metadata<Ty = ObjectMeta>) -> String {
-    ns.metadata().unwrap().name.as_ref().unwrap().to_owned()
+    ns.metadata().name.as_ref().unwrap().to_owned()
 }
 
 fn is_e2e_namespace(namespace: &str) -> bool {

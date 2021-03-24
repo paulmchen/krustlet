@@ -1,8 +1,8 @@
 //! `log` contains convenient wrappers around fetching logs from the Kubernetes API.
 use anyhow::bail;
-use log::{debug, error};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead};
+use tracing::{debug, error};
 
 /// Possible errors sending log data.
 #[derive(Debug)]
@@ -165,7 +165,7 @@ pub async fn stream<R: AsyncRead + std::marker::Unpin>(
                 Err(SendError::Abnormal(e)) => bail!(e),
             }
 
-            tokio::time::delay_for(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
 
